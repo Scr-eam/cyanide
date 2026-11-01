@@ -54,28 +54,14 @@ static unsigned int s_cylinderlite_one_shot_cleanup_ticks = 0;
 // are applied; transformed frames must never be used to calculate swipe progress.
 typedef struct {
     uint64_t layer;
-    uint64_t setters[3]; // position, transform, opacity; reused for the whole session
     CATransform3D transform;
-    CLPoint position;
     double opacity, width, height;
+    float lastOpacity;
     bool modified;
 } CLPageVisual;
 static CLPageVisual s_page_visuals[16];
 static double s_last_offset = NAN;
 static double s_perspective_distance = 0;
-
-typedef struct {
-    CLPoint position;
-    CATransform3D transform;
-    float opacity;
-} CLFrameValues;
-static CLFrameValues s_frame_values[16];
-static uint64_t s_frame_memory, s_frame_batch, s_offset_invocation;
-static uint64_t s_transaction_begin, s_transaction_disable, s_transaction_commit;
-static uint32_t s_batch_mask;
-static bool s_write_position;
-static unsigned int s_frame_count;
-static double s_frame_total_ms, s_frame_max_ms;
 
 static void cl_restore_follow_pages(void);
 
@@ -682,144 +668,49 @@ static uint64_t cl_find_current_page_list(int *pageOut, int *directionOut)
     return bestList;
 }
 
-static void cl_write_layer(CLPageVisual *page, CATransform3D transform, double opacity, double offset)
+// Apply the former layer.position.x displacement AFTER perspective division.
+// With row-vector CATransform3D convention, x' = x / w + offset is represented
+// by adding offset * column(w) to column(x). Merely changing m41 would be wrong
+// for cube/card/hinge effects. The model position is now entirely SpringBoard's.
+static CATransform3D cl_compensate_position(CATransform3D t, double offset)
 {
-    // Stage locally. No layer setter is sent until all affected pages are ready.
-    CLFrameValues *values = &s_frame_values[page - s_page_visuals];
-    values->position = page->position;
-    values->position.x += offset;
-    values->transform = transform;
+    t.m11 += offset * t.m14;
+    t.m21 += offset * t.m24;
+    t.m31 += offset * t.m34;
+    t.m41 += offset * t.m44;
+    return t;
+}
+
+static bool cl_write_layer(CLPageVisual *page, CATransform3D transform, double opacity, double offset)
+{
+    transform = cl_compensate_position(transform, offset);
+    r_msg2_main_raw(page->layer, "setTransform:", &transform, sizeof(transform),
+                    NULL, 0, NULL, 0, NULL, 0);
+    if (!remote_call_current_success()) return false;
     // CALayer.opacity is a float, unlike UIView.alpha (CGFloat).
-    values->opacity = (float)fmax(0.0, fmin(1.0, opacity));
-}
-
-static void cl_release_owned(uint64_t *object)
-{
-    if (r_is_objc_ptr(*object)) r_msg2(*object, "release", 0, 0, 0, 0);
-    *object = 0;
-}
-
-// Build once, not once per property per frame. These invocations own their
-// targets, and are never modified while the main thread is executing a batch.
-static uint64_t cl_cached_invocation(uint64_t target, const char *name,
-                                      const void *argument, size_t size)
-{
-    uint64_t selector = r_sel(name);
-    uint64_t signature = r_msg2(target, "methodSignatureForSelector:", selector, 0, 0, 0);
-    if (!r_is_objc_ptr(signature)) return 0;
-    uint64_t invocation = r_msg2(r_class("NSInvocation"), "invocationWithMethodSignature:",
-                                signature, 0, 0, 0);
-    if (!r_is_objc_ptr(invocation)) return 0;
-    invocation = r_msg2(invocation, "retain", 0, 0, 0, 0);
-    if (!r_is_objc_ptr(invocation)) return 0;
-    r_msg2(invocation, "setTarget:", target, 0, 0, 0);
-    if (!remote_call_current_success()) { cl_release_owned(&invocation); return 0; }
-    r_msg2(invocation, "setSelector:", selector, 0, 0, 0);
-    if (!remote_call_current_success()) { cl_release_owned(&invocation); return 0; }
-    if (size) {
-        if (!s_frame_memory || size > sizeof(s_frame_values) ||
-            !remote_write(s_frame_memory, argument, size)) {
-            cl_release_owned(&invocation);
-            return 0;
-        }
-        r_msg2(invocation, "setArgument:atIndex:", s_frame_memory, 2, 0, 0);
-        if (!remote_call_current_success()) {
-            cl_release_owned(&invocation);
-            return 0;
-        }
+    // Opaque cube/hinge/rotation frames need only the transform call. Fade/card
+    // frames write opacity when it changes, including the final restoration.
+    float alpha = (float)fmax(0.0, fmin(1.0, opacity));
+    if (alpha != page->lastOpacity) {
+        r_msg2_main_raw(page->layer, "setOpacity:", &alpha, sizeof(alpha),
+                    NULL, 0, NULL, 0, NULL, 0);
+        if (!remote_call_current_success()) return false;
+        page->lastOpacity = alpha;
     }
-    r_msg2(invocation, "retainArguments", 0, 0, 0, 0);
-    if (!remote_call_current_success()) { cl_release_owned(&invocation); return 0; }
-    return invocation;
-}
-
-static bool cl_submit_frame(uint32_t mask)
-{
-    if (!mask) return true;
-    if (!s_frame_memory || !s_transaction_begin || !s_transaction_disable ||
-        !s_transaction_commit) return false;
-
-    // Usually the same pair of pages is visible for an entire swipe. Rebuild
-    // only when that set changes (including a departing page needing reset).
-    if (!s_frame_batch || s_batch_mask != mask) {
-        uint64_t objects[3 + 16 * 3];
-        size_t count = 0;
-        objects[count++] = s_transaction_begin;
-        objects[count++] = s_transaction_disable;
-        for (int i = 0; i < 16; i++) if (mask & (1u << i)) {
-            for (int j = s_write_position ? 0 : 1; j < 3; j++) {
-                if (!r_is_objc_ptr(s_page_visuals[i].setters[j])) return false;
-                objects[count++] = s_page_visuals[i].setters[j];
-            }
-        }
-        objects[count++] = s_transaction_commit;
-        if (!remote_write(s_frame_memory, objects, count * sizeof(uint64_t))) return false;
-        uint64_t batch = r_msg2(r_class("NSArray"), "alloc", 0, 0, 0, 0);
-        batch = r_msg2(batch, "initWithObjects:count:", s_frame_memory, count, 0, 0);
-        if (!r_is_objc_ptr(batch)) return false;
-        cl_release_owned(&s_frame_batch);
-        s_frame_batch = batch;
-        s_batch_mask = mask;
-    }
-
-    // One memory transfer for the frame. setArgument copies bytes into the
-    // cached invocation; the scratch storage is not referenced during invoke.
-    if (!remote_write(s_frame_memory, s_frame_values, sizeof(s_frame_values))) return false;
-    const size_t offsets[3] = { offsetof(CLFrameValues, position),
-                               offsetof(CLFrameValues, transform),
-                               offsetof(CLFrameValues, opacity) };
-    uint64_t setArg = r_sel("setArgument:atIndex:");
-    for (int i = 0; i < 16; i++) if (mask & (1u << i)) {
-        for (int j = s_write_position ? 0 : 1; j < 3; j++) {
-            r_msg(s_page_visuals[i].setters[j], setArg,
-                  s_frame_memory + i * sizeof(CLFrameValues) + offsets[j], 2, 0, 0);
-            if (!remote_call_current_success()) return false;
-        }
-    }
-
-    // NSArray invokes in order. begin -> disableActions -> all setters -> commit
-    // runs within ONE main-thread dispatch. Never leave a transaction open
-    // between remote calls, and never pause the scroll layer's clock.
-    r_perform_main(s_frame_batch, r_sel("makeObjectsPerformSelector:"), r_sel("invoke"), true);
-    return remote_call_current_success();
+    return true;
 }
 
 static void cl_restore_follow_pages(void)
 {
-    uint32_t oldSettle = r_settle_us(0);
-    uint32_t mask = 0;
     for (int i = 0; i < 16; i++) {
         CLPageVisual *page = &s_page_visuals[i];
-        if (page->modified) {
-            cl_write_layer(page, page->transform, page->opacity, 0);
-            mask |= 1u << i;
-        }
+        if (!page->layer) continue;
+        if (page->modified && !cl_write_layer(page, page->transform, page->opacity, 0))
+            log_user("[CYLINDERLITE] Page restoration call failed.\n");
+        r_msg2_main(page->layer, "release", 0, 0, 0, 0);
     }
-    if (!cl_submit_frame(mask))
-        log_user("[CYLINDERLITE] Could not confirm page restoration; stop/reapply or respring if icons remain altered.\n");
-    cl_release_owned(&s_frame_batch);
-    for (int i = 0; i < 16; i++) {
-        for (int j = 0; j < 3; j++) cl_release_owned(&s_page_visuals[i].setters[j]);
-        // Release retained UI layers on the main thread.
-        if (s_page_visuals[i].layer)
-            r_msg2_main(s_page_visuals[i].layer, "release", 0, 0, 0, 0);
-    }
-    // The offset invocation retains a UIView target; final release belongs on main.
-    if (s_offset_invocation) r_msg2_main(s_offset_invocation, "release", 0, 0, 0, 0);
-    s_offset_invocation = 0;
-    cl_release_owned(&s_transaction_begin);
-    cl_release_owned(&s_transaction_disable);
-    cl_release_owned(&s_transaction_commit);
-    if (s_frame_memory) r_free(s_frame_memory);
-    s_frame_memory = 0;
-    s_batch_mask = 0;
-    if (s_frame_count) printf("[CYLINDERLITE] v2 frames=%u workMean=%.1fms workMax=%.1fms (excludes poll sleep)\n",
-        s_frame_count, s_frame_total_ms / s_frame_count, s_frame_max_ms);
-    s_frame_count = 0;
-    s_frame_total_ms = s_frame_max_ms = 0;
     memset(s_page_visuals, 0, sizeof(s_page_visuals));
     s_last_offset = NAN;
-    r_settle_us(oldSettle);
 }
 
 static bool cl_capture_page(int index)
@@ -830,9 +721,7 @@ static bool cl_capture_page(int index)
     CLRect bounds = {0};
     CATransform3D transform;
     float opacity = 1;
-    CLPoint position;
     if (!r_is_objc_ptr(layer) || !cl_get_rect(layer, "bounds", &bounds) ||
-        !cl_get_point(layer, "position", &position) ||
         bounds.width <= 1 || bounds.height <= 1 ||
         !r_msg2_main_struct_ret(layer, "transform", &transform, sizeof(transform),
                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0) ||
@@ -840,59 +729,18 @@ static bool cl_capture_page(int index)
                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0)) return false;
     page->layer = r_msg2_main(layer, "retain", 0, 0, 0, 0);
     page->transform = transform;
-    page->position = position;
     page->opacity = opacity;
+    page->lastOpacity = opacity;
     page->width = bounds.width;
     page->height = bounds.height;
-    if (!r_is_objc_ptr(page->layer)) return false;
-    if (s_write_position)
-        page->setters[0] = cl_cached_invocation(layer, "setPosition:", &position, sizeof(position));
-    page->setters[1] = cl_cached_invocation(layer, "setTransform:", &transform, sizeof(transform));
-    page->setters[2] = cl_cached_invocation(layer, "setOpacity:", &opacity, sizeof(opacity));
-    return (!s_write_position || page->setters[0]) && page->setters[1] && page->setters[2];
-}
-
-static bool cl_prepare_follow_renderer(void)
-{
-    uint32_t oldSettle = r_settle_us(0);
-    s_write_position = s_cylinderlite_effect == CylinderLiteEffectCubeInside ||
-        s_cylinderlite_effect == CylinderLiteEffectCubeOutside ||
-        s_cylinderlite_effect == CylinderLiteEffectCardHorizontal ||
-        s_cylinderlite_effect == CylinderLiteEffectCardVertical ||
-        s_cylinderlite_effect == CylinderLiteEffectHinge;
-    s_frame_memory = r_dlsym_call(R_TIMEOUT, "malloc", sizeof(s_frame_values), 0, 0, 0, 0, 0, 0, 0);
-    bool ok = s_frame_memory != 0;
-    if (ok) {
-        BOOL disable = YES;
-        uint64_t transaction = r_class("CATransaction");
-        s_transaction_begin = cl_cached_invocation(transaction, "begin", NULL, 0);
-        s_transaction_disable = cl_cached_invocation(transaction, "setDisableActions:", &disable, sizeof(disable));
-        s_transaction_commit = cl_cached_invocation(transaction, "commit", NULL, 0);
-        s_offset_invocation = cl_cached_invocation(s_cylinderlite_scroll, "contentOffset", NULL, 0);
-        ok = s_transaction_begin && s_transaction_disable && s_transaction_commit && s_offset_invocation;
-    }
-    // Pay discovery/allocation costs at Apply, not on the first swipe to a page.
-    for (int i = 0; ok && i < s_cylinderlite_list_count; i++) ok = cl_capture_page(i);
-    if (!ok) cl_restore_follow_pages();
-    r_settle_us(oldSettle);
-    return ok;
-}
-
-static bool cl_read_follow_offset(CLPoint *offset)
-{
-    if (!s_offset_invocation || !s_frame_memory) return false;
-    r_perform_main(s_offset_invocation, r_sel("invoke"), 0, true);
-    if (!remote_call_current_success()) return false;
-    r_msg2(s_offset_invocation, "getReturnValue:", s_frame_memory, 0, 0, 0);
-    return remote_call_current_success() && remote_read(s_frame_memory, offset, sizeof(*offset)) &&
-        isfinite(offset->x) && isfinite(offset->y);
+    return r_is_objc_ptr(page->layer);
 }
 
 // Page formulas adapted from Cylinder-Remade's CylinderAnimator.swift.
 // Offset has the same sign as upstream: contentOffset.x - page.frame.origin.x.
-// Position compensation is applied separately, as in the original: translation
-// inside a perspective matrix is not equivalent to moving the layer position.
-static void cl_follow_effect(CLPageVisual *page, double offset)
+// Position compensation is folded into the final homogeneous transform by
+// cl_compensate_position, so no separate model-position write is needed.
+static bool cl_follow_effect(CLPageVisual *page, double offset)
 {
     double p = offset / page->width;
     double q = fabs(p);
@@ -990,18 +838,17 @@ static void cl_follow_effect(CLPageVisual *page, double offset)
             break;
         }
     }
-    cl_write_layer(page, CATransform3DConcat(t, page->transform), alpha * page->opacity, compensation);
+    // Mark before writing: a failed opacity call can follow a successful transform.
     page->modified = true;
+    return cl_write_layer(page, CATransform3DConcat(t, page->transform), alpha * page->opacity, compensation);
 }
 
 static bool cl_tick_follow(void)
 {
-    if (!s_offset_invocation && !cl_prepare_follow_renderer()) return false;
-    double started = CACurrentMediaTime();
     CLPoint offset;
-    if (!cl_read_follow_offset(&offset)) return false;
+    if (!cl_get_point_fast(s_cylinderlite_scroll, "contentOffset", &offset) ||
+        !isfinite(offset.x)) return false;
     if (isfinite(s_last_offset) && fabs(offset.x - s_last_offset) < 0.01) return true;
-    uint32_t mask = 0, restoredMask = 0;
     for (int i = 0; i < s_cylinderlite_list_count; i++) {
         CLPageVisual *page = &s_page_visuals[i];
         double delta = offset.x - s_cylinderlite_list_x[i];
@@ -1010,23 +857,14 @@ static bool cl_tick_follow(void)
         bool visible = s_cylinderlite_list_x[i] < offset.x + s_cylinderlite_page_width &&
                        s_cylinderlite_list_x[i] + s_cylinderlite_page_width > offset.x;
         if (visible && fabs(delta) > 0.5) {
-            cl_follow_effect(page, delta);
-            mask |= 1u << i;
+            if (!cl_capture_page(i)) return false;
+            if (!cl_follow_effect(page, delta)) return false;
         } else if (page->modified) {
-            cl_write_layer(page, page->transform, page->opacity, 0);
-            mask |= 1u << i;
-            restoredMask |= 1u << i;
+            if (!cl_write_layer(page, page->transform, page->opacity, 0)) return false;
+            page->modified = false;
         }
     }
-    if (!cl_submit_frame(mask)) return false;
-    for (int i = 0; i < 16; i++) if (restoredMask & (1u << i)) s_page_visuals[i].modified = false;
     s_last_offset = offset.x;
-    if (mask) {
-        double elapsed = (CACurrentMediaTime() - started) * 1000;
-        s_frame_count++;
-        s_frame_total_ms += elapsed;
-        s_frame_max_ms = fmax(s_frame_max_ms, elapsed);
-    }
     return true;
 }
 
@@ -1254,8 +1092,7 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     bool cacheOK = cl_refresh_page_cache();
     printf("[CYLINDERLITE] page cache result=%d; preparing templates next\n", cacheOK);
     cl_release_animation_templates();
-    bool templatesOK = cacheOK && (followGesture ? cl_prepare_follow_renderer()
-                                               : cl_prepare_animation_templates(effect));
+    bool templatesOK = cacheOK && (followGesture || cl_prepare_animation_templates(effect));
     printf("[CYLINDERLITE] templates result=%d; locating current page next\n", templatesOK);
     int page = -1;
     int direction = 1;
@@ -1268,8 +1105,8 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     if (ok) {
         s_cylinderlite_last_page = page;
         s_cylinderlite_last_list = list;
-        printf("[CYLINDERLITE] armed %s monitor page=%d list=0x%llx pan=0x%llx effect=%d minScale=%d minOpacity=%d durationMs=%d\n",
-               s_cylinderlite_follow_gesture ? "v2-batched-progress" : "one-shot",
+        printf("[CYLINDERLITE] armed %s monitor page=%d list=0x%llx pan=0x%llx effect=%d minScale=%d minOpacity=%d durationMs=%d templates=4\n",
+               s_cylinderlite_follow_gesture ? "v3-transform-only" : "one-shot",
                page,
                (unsigned long long)list,
                (unsigned long long)s_cylinderlite_pan,
@@ -1282,11 +1119,6 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
         ? "[CYLINDERLITE] Page animation monitor armed. Swipe between Home Screen pages to test it.\n"
         : "[CYLINDERLITE] Could not locate the current Home Screen page.\n");
     s_cylinderlite_active = ok;
-    if (!ok) {
-        cl_restore_follow_pages();
-        cl_release_animation_templates();
-        cl_clear_page_cache();
-    }
     return ok;
 }
 
@@ -1337,11 +1169,6 @@ bool cylinderlite_stop_in_session(void)
 void cylinderlite_forget_remote_state(void)
 {
     // SpringBoard is gone: never release or message pointers from the old process.
-    s_frame_memory = s_frame_batch = s_offset_invocation = 0;
-    s_transaction_begin = s_transaction_disable = s_transaction_commit = 0;
-    s_batch_mask = s_frame_count = 0;
-    s_frame_total_ms = s_frame_max_ms = 0;
-    memset(s_frame_values, 0, sizeof(s_frame_values));
     memset(s_page_visuals, 0, sizeof(s_page_visuals));
     s_last_offset = NAN;
     s_cylinderlite_active = false;
