@@ -9,6 +9,7 @@
 #import "../LogTextView.h"
 
 #import <Foundation/Foundation.h>
+#import <QuartzCore/QuartzCore.h>
 #import <float.h>
 #import <math.h>
 #import <stdio.h>
@@ -48,6 +49,21 @@ static unsigned int s_cylinderlite_idle_ticks = 0;
 static uint64_t s_cylinderlite_one_shot_cleanup_from_list = 0;
 static uint64_t s_cylinderlite_one_shot_cleanup_to_list = 0;
 static unsigned int s_cylinderlite_one_shot_cleanup_ticks = 0;
+
+// Retained only while a live session exists. Geometry is captured before effects
+// are applied; transformed frames must never be used to calculate swipe progress.
+typedef struct {
+    uint64_t layer;
+    CATransform3D transform;
+    CLPoint position;
+    double opacity, width, height;
+    bool modified;
+} CLPageVisual;
+static CLPageVisual s_page_visuals[16];
+static double s_last_offset = NAN;
+static double s_perspective_distance = 0;
+
+static void cl_restore_follow_pages(void);
 
 static NSString * const kCylinderLiteAnimationKey = @"com.darksword.cylinderlite.page";
 
@@ -517,6 +533,7 @@ static void cl_clear_page_cache(void)
 
 static bool cl_refresh_page_cache(void)
 {
+    cl_restore_follow_pages();
     cl_clear_page_cache();
 
     uint64_t scrollClass = r_class("SBIconScrollView");
@@ -553,6 +570,15 @@ static bool cl_refresh_page_cache(void)
         for (int j = 0; j < listCount; j++) {
             CLRect frame = {0};
             if (!cl_get_rect(lists[j], "frame", &frame)) continue;
+            uint64_t parent = cl_safe_msg(lists[j], "superview", 0, 0, 0, 0);
+            if (parent != scroll) {
+                CLRect converted = {0};
+                if (!r_is_objc_ptr(parent) ||
+                    !r_msg2_main_struct_ret(parent, "convertRect:toView:",
+                        &converted, sizeof(converted), &frame, sizeof(frame),
+                        &scroll, sizeof(scroll), NULL, 0, NULL, 0)) continue;
+                frame = converted;
+            }
             lists[usableCount] = lists[j];
             listX[usableCount] = frame.x;
             usableCount++;
@@ -579,6 +605,10 @@ static bool cl_refresh_page_cache(void)
     s_cylinderlite_page_width = bestPageWidth;
     memcpy(s_cylinderlite_lists, bestLists, sizeof(uint64_t) * (size_t)bestCount);
     memcpy(s_cylinderlite_list_x, bestListX, sizeof(double) * (size_t)bestCount);
+    uint64_t screen = cl_safe_msg(r_class("UIScreen"), "mainScreen", 0, 0, 0, 0);
+    CLRect screenBounds = {0};
+    s_perspective_distance = cl_get_rect(screen, "bounds", &screenBounds)
+        ? (screenBounds.width + screenBounds.height) / 2 : 0;
     printf("[CYLINDERLITE] cached scroll=0x%llx pan=0x%llx lists=%d pageWidth=%.1f\n",
            (unsigned long long)s_cylinderlite_scroll,
            (unsigned long long)s_cylinderlite_pan,
@@ -638,6 +668,188 @@ static uint64_t cl_find_current_page_list(int *pageOut, int *directionOut)
     return bestList;
 }
 
+static void cl_write_layer(CLPageVisual *page, CATransform3D transform, double opacity, double offset)
+{
+    CLPoint position = page->position;
+    position.x += offset;
+    r_msg2_main_raw(page->layer, "setPosition:", &position, sizeof(position),
+                    NULL, 0, NULL, 0, NULL, 0);
+    r_msg2_main_raw(page->layer, "setTransform:", &transform, sizeof(transform),
+                    NULL, 0, NULL, 0, NULL, 0);
+    // CALayer.opacity is a float, unlike UIView.alpha (CGFloat).
+    float alpha = (float)fmax(0.0, fmin(1.0, opacity));
+    r_msg2_main_raw(page->layer, "setOpacity:", &alpha, sizeof(alpha),
+                    NULL, 0, NULL, 0, NULL, 0);
+}
+
+static void cl_restore_follow_pages(void)
+{
+    for (int i = 0; i < 16; i++) {
+        CLPageVisual *page = &s_page_visuals[i];
+        if (!page->layer) continue;
+        if (page->modified) cl_write_layer(page, page->transform, page->opacity, 0);
+        r_msg2_main(page->layer, "release", 0, 0, 0, 0);
+    }
+    memset(s_page_visuals, 0, sizeof(s_page_visuals));
+    s_last_offset = NAN;
+}
+
+static bool cl_capture_page(int index)
+{
+    CLPageVisual *page = &s_page_visuals[index];
+    if (page->layer) return true;
+    uint64_t layer = cl_safe_msg(s_cylinderlite_lists[index], "layer", 0, 0, 0, 0);
+    CLRect bounds = {0};
+    CATransform3D transform;
+    float opacity = 1;
+    CLPoint position;
+    if (!r_is_objc_ptr(layer) || !cl_get_rect(layer, "bounds", &bounds) ||
+        !cl_get_point(layer, "position", &position) ||
+        bounds.width <= 1 || bounds.height <= 1 ||
+        !r_msg2_main_struct_ret(layer, "transform", &transform, sizeof(transform),
+                                NULL, 0, NULL, 0, NULL, 0, NULL, 0) ||
+        !r_msg2_main_struct_ret(layer, "opacity", &opacity, sizeof(opacity),
+                                NULL, 0, NULL, 0, NULL, 0, NULL, 0)) return false;
+    page->layer = r_msg2_main(layer, "retain", 0, 0, 0, 0);
+    page->transform = transform;
+    page->position = position;
+    page->opacity = opacity;
+    page->width = bounds.width;
+    page->height = bounds.height;
+    return r_is_objc_ptr(page->layer);
+}
+
+// Page formulas adapted from Cylinder-Remade's CylinderAnimator.swift.
+// Offset has the same sign as upstream: contentOffset.x - page.frame.origin.x.
+// Position compensation is applied separately, as in the original: translation
+// inside a perspective matrix is not equivalent to moving the layer position.
+static void cl_follow_effect(CLPageVisual *page, double offset)
+{
+    double p = offset / page->width;
+    double q = fabs(p);
+    double strength = s_cylinderlite_intensity_pct / 100.0;
+    double angle = p * M_PI;
+    double compensation = 0;
+    double alpha = 1;
+    CATransform3D t = CATransform3DIdentity;
+    double perspective = s_perspective_distance > 1 ? s_perspective_distance
+        : (s_cylinderlite_page_width + page->height) / 2.0;
+    switch (s_cylinderlite_effect) {
+        case CylinderLiteEffectBackwards:
+            t = CATransform3DMakeTranslation(2 * offset, 0, 0);
+            break;
+        case CylinderLiteEffectCubeInside:
+        case CylinderLiteEffectCubeOutside: {
+            bool outside = s_cylinderlite_effect == CylinderLiteEffectCubeOutside;
+            angle = p * M_PI_2;
+            double h = page->width / 2;
+            double x = h * cos(fabs(angle)) - h;
+            double z = h * sin(fabs(angle)) * (outside ? -1 : 1);
+            if (p > 0) x = -x;
+            x -= offset;
+            compensation = offset;
+            t = CATransform3DMakeTranslation(x, 0, z);
+            t.m44 = 1 - z / perspective;
+            t.m34 = -1 / perspective;
+            t = CATransform3DRotate(t, outside ? -angle : angle, 0, 1, 0);
+            if (outside) {
+                double threshold = atan2(perspective - z, fabs(x));
+                if (fabs(angle) > threshold && M_PI_2 - threshold > 1e-6)
+                    alpha = 1 - (fabs(angle) - threshold) / (M_PI_2 - threshold);
+            }
+            break;
+        }
+        case CylinderLiteEffectCardHorizontal:
+        case CylinderLiteEffectCardVertical: {
+            bool vertical = s_cylinderlite_effect == CylinderLiteEffectCardVertical;
+            compensation = offset;
+            alpha = q >= 0.5 ? 0 : 1;
+            t.m34 = -1 / perspective;
+            t = CATransform3DRotate(t, vertical ? angle : -angle,
+                                    vertical ? 1 : 0, vertical ? 0 : 1, 0);
+            break;
+        }
+        case CylinderLiteEffectHinge: {
+            compensation = offset;
+            double x = p > 0 ? -page->width / 2 : page->width / 2;
+            t = CATransform3DMakeTranslation(x, 0, 0);
+            t.m34 = -1 / perspective;
+            t = CATransform3DRotate(t, angle, 0, 1, 0);
+            t = CATransform3DTranslate(t, -x, 0, 0);
+            break;
+        }
+        case CylinderLiteEffectPageFlip:
+        case CylinderLiteEffectPageTwist: {
+            bool twist = s_cylinderlite_effect == CylinderLiteEffectPageTwist;
+            alpha = 1 - q;
+            t.m34 = -1 / perspective;
+            t = CATransform3DRotate(t, twist ? -2.0 / 3.0 * angle : angle,
+                                    twist ? 1 : 0, twist ? 0 : 1, 0);
+            break;
+        }
+        case CylinderLiteEffectVerticalScroll:
+            t = CATransform3DMakeTranslation(offset, p * page->height, 0);
+            alpha = 1 - q;
+            break;
+        // Cyanide-specific effects: keep these distinct from upstream ports.
+        case CylinderLiteEffectSlide:
+            alpha = 1 - q * (1 - s_cylinderlite_opacity_pct / 100.0);
+            break;
+        case CylinderLiteEffectFlip:
+            t = CATransform3DMakeScale(fmax(0.01, 1 - q * strength), 1, 1);
+            break;
+        case CylinderLiteEffectPageSpin:
+            t = CATransform3DMakeRotation(2 * angle * strength, 0, 0, 1);
+            break;
+        case CylinderLiteEffectWheel:
+            // Legacy page-level approximation; upstream Wheel moves each icon.
+            t = CATransform3DMakeRotation(-angle * 0.35 * strength, 0, 0, 1);
+            break;
+        case CylinderLiteEffectHellaFar:
+            t = CATransform3DMakeTranslation(-offset, 0, 0);
+            break;
+        case CylinderLiteEffectTurn:
+            t.m34 = -1 / perspective;
+            t = CATransform3DRotate(t, -angle / 2, 0, 1, 0);
+            break;
+        case CylinderLiteEffectZoomFadeIn:
+        case CylinderLiteEffectZoomFadeOut: {
+            double scale = s_cylinderlite_effect == CylinderLiteEffectZoomFadeIn
+                ? 1 + q * (1 - strength) * 1.55 : 1 - q * (1 - strength);
+            t = CATransform3DMakeScale(scale, scale, 1);
+            alpha = 1 - q * (1 - s_cylinderlite_opacity_pct / 100.0);
+            break;
+        }
+    }
+    cl_write_layer(page, CATransform3DConcat(t, page->transform), alpha * page->opacity, compensation);
+    page->modified = true;
+}
+
+static bool cl_tick_follow(void)
+{
+    CLPoint offset;
+    if (!cl_get_point_fast(s_cylinderlite_scroll, "contentOffset", &offset) ||
+        !isfinite(offset.x)) return false;
+    if (isfinite(s_last_offset) && fabs(offset.x - s_last_offset) < 0.01) return true;
+    for (int i = 0; i < s_cylinderlite_list_count; i++) {
+        CLPageVisual *page = &s_page_visuals[i];
+        double delta = offset.x - s_cylinderlite_list_x[i];
+        // Follow actual offset through dragging, reversal, cancellation and
+        // deceleration. No gesture-state gate or synthetic finish animation.
+        bool visible = s_cylinderlite_list_x[i] < offset.x + s_cylinderlite_page_width &&
+                       s_cylinderlite_list_x[i] + s_cylinderlite_page_width > offset.x;
+        if (visible && fabs(delta) > 0.5) {
+            if (!cl_capture_page(i)) return false;
+            cl_follow_effect(page, delta);
+        } else if (page->modified) {
+            cl_write_layer(page, page->transform, page->opacity, 0);
+            page->modified = false;
+        }
+    }
+    s_last_offset = offset.x;
+    return true;
+}
+
 bool cylinderlite_tick_in_session(void)
 {
     if (!s_cylinderlite_active) return false;
@@ -646,6 +858,11 @@ bool cylinderlite_tick_in_session(void)
     }
 
     uint32_t oldSettle = r_settle_us(0);
+    if (s_cylinderlite_follow_gesture) {
+        bool ok = cl_tick_follow();
+        r_settle_us(oldSettle);
+        return ok;
+    }
     uint64_t state = r_msg2_main(s_cylinderlite_pan, "state", 0, 0, 0, 0);
     bool gestureActive = state == 1 || state == 2;
     bool scrollSettling = !gestureActive &&
@@ -842,20 +1059,22 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     if (effect < CylinderLiteEffectSlide || effect > CylinderLiteEffectLast) {
         effect = CylinderLiteEffectZoomFadeOut;
     }
+    cl_remove_cached_page_animations();
+    cl_restore_follow_pages();
     s_cylinderlite_effect = effect;
     s_cylinderlite_intensity_pct = cl_clamp_int(intensityPct, 70, 100);
     s_cylinderlite_opacity_pct = cl_clamp_int(opacityPct, 10, 100);
     s_cylinderlite_follow_gesture = followGesture;
     s_cylinderlite_one_shot_duration_ms = cl_clamp_int(oneShotDurationMs, 250, 800);
     s_cylinderlite_active = true;
-    cl_remove_cached_page_animations();
     s_cylinderlite_last_page = -9999;
     s_cylinderlite_last_list = 0;
     cl_clear_one_shot_cleanup(false);
     cl_clear_page_cache();
     bool cacheOK = cl_refresh_page_cache();
     printf("[CYLINDERLITE] page cache result=%d; preparing templates next\n", cacheOK);
-    bool templatesOK = cacheOK && cl_prepare_animation_templates(effect);
+    cl_release_animation_templates();
+    bool templatesOK = cacheOK && (followGesture || cl_prepare_animation_templates(effect));
     printf("[CYLINDERLITE] templates result=%d; locating current page next\n", templatesOK);
     int page = -1;
     int direction = 1;
@@ -881,6 +1100,7 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     log_user(ok
         ? "[CYLINDERLITE] Page animation monitor armed. Swipe between Home Screen pages to test it.\n"
         : "[CYLINDERLITE] Could not locate the current Home Screen page.\n");
+    s_cylinderlite_active = ok;
     return ok;
 }
 
@@ -892,6 +1112,7 @@ bool cylinderlite_apply_in_session(CylinderLiteEffect effect)
 bool cylinderlite_stop_in_session(void)
 {
     s_cylinderlite_active = false;
+    cl_restore_follow_pages();
     uint64_t listClass = r_class("SBIconListView");
     uint64_t key = r_nsstr_retained(kCylinderLiteAnimationKey.UTF8String);
     if (!r_is_objc_ptr(listClass) || !r_is_objc_ptr(key)) {
@@ -929,6 +1150,9 @@ bool cylinderlite_stop_in_session(void)
 
 void cylinderlite_forget_remote_state(void)
 {
+    // SpringBoard is gone: never release or message pointers from the old process.
+    memset(s_page_visuals, 0, sizeof(s_page_visuals));
+    s_last_offset = NAN;
     s_cylinderlite_active = false;
     s_cylinderlite_effect = CylinderLiteEffectZoomFadeOut;
     s_cylinderlite_follow_gesture = true;

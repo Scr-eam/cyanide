@@ -3561,10 +3561,7 @@ static CylinderLiteEffect settings_cylinderlite_effect_from_defaults(NSUserDefau
         return CylinderLiteEffectZoomFadeOut;
     }
     switch ((CylinderLiteEffect)raw) {
-        case CylinderLiteEffectBackwards:
         case CylinderLiteEffectHellaFar:
-        case CylinderLiteEffectCubeInside:
-        case CylinderLiteEffectCubeOutside:
         case CylinderLiteEffectTurn:
             return CylinderLiteEffectZoomFadeOut;
         default:
@@ -3579,7 +3576,7 @@ static bool settings_apply_cylinderlite_from_defaults_locked(NSUserDefaults *d)
     return cylinderlite_apply_in_session_with_options(settings_cylinderlite_effect_from_defaults(d),
                                                       (int)[d integerForKey:kSettingsCylinderLiteIntensityPct],
                                                       (int)[d integerForKey:kSettingsCylinderLiteOpacityPct],
-                                                      false,
+                                                      true,
                                                       (int)[d integerForKey:kSettingsCylinderLiteOneShotDurationMs]);
 }
 
@@ -3634,6 +3631,9 @@ static NSArray<NSNumber *> *settings_cylinderlite_effect_values(void)
         @(CylinderLiteEffectPageFlip),
         @(CylinderLiteEffectPageTwist),
         @(CylinderLiteEffectVerticalScroll),
+        @(CylinderLiteEffectBackwards),
+        @(CylinderLiteEffectCubeInside),
+        @(CylinderLiteEffectCubeOutside),
         @(CylinderLiteEffectCardHorizontal),
         @(CylinderLiteEffectCardVertical),
         @(CylinderLiteEffectWheel),
@@ -4770,7 +4770,8 @@ static void settings_start_cylinderlite_live_loop(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSUInteger tick = 0;
         NSUInteger failures = 0;
-        useconds_t intervalUS = settings_live_interval(80000, 120000);
+        // Remote calls add their own latency; this is a sleep budget, not an FPS guarantee.
+        useconds_t intervalUS = settings_live_interval(16000, 16000);
         @try {
             printf("[SETTINGS] Cylinder Lite live loop started interval=%uus\n", intervalUS);
             while ([d boolForKey:kSettingsCylinderLiteEnabled] &&
@@ -4799,6 +4800,13 @@ static void settings_start_cylinderlite_live_loop(void)
                    [d boolForKey:kSettingsCylinderLiteEnabled],
                    (unsigned long)failures,
                    g_cylinderlite_live_stop_requested);
+            // A failed monitor must not leave a partially rotated/hidden page.
+            if (failures >= settings_live_failure_limit(5)) {
+                @synchronized (settings_rc_lock()) {
+                    if (g_springboard_rc_ready && !settings_cleanup_in_progress())
+                        cylinderlite_stop_in_session();
+                }
+            }
             __sync_lock_release(&g_cylinderlite_live_running);
         }
     });
@@ -7261,7 +7269,7 @@ void settings_register_defaults(void)
         kSettingsCylinderLiteEffect:       @(CylinderLiteEffectZoomFadeOut),
         kSettingsCylinderLiteIntensityPct: @90,
         kSettingsCylinderLiteOpacityPct:   @35,
-        kSettingsCylinderLiteFollowGesture: @NO,
+        kSettingsCylinderLiteFollowGesture: @YES,
         kSettingsCylinderLiteOneShotDurationMs: @520,
 
         kSettingsStatBarEnabled: @NO,
@@ -9286,7 +9294,7 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
     NSMutableArray<NSDictionary *> *rows = [@[
         @{ @"kind": @"info",
            @"title": NSLocalizedString(@"Page Animation", nil),
-           @"subtitle": NSLocalizedString(@"Animates the current Home Screen page container when the page changes. It does not animate individual icons or write icon layout state.", nil) },
+           @"subtitle": NSLocalizedString(@"Follows your swipe, including reversals and deceleration. Cube, card, hinge, flip, twist, backwards and vertical scroll use Cylinder Remade page formulas. Wheel is still a page-level approximation. Smoothness depends on Cyanide remaining active.", nil) },
         @{ @"kind": @"choice",
            @"key": kSettingsCylinderLiteEffect,
            @"title": NSLocalizedString(@"Effect", nil),
@@ -9303,7 +9311,7 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
                            @"step": @5,
                            @"unit": @"%",
                            @"default": @90 }];
-    } else {
+    } else if (effect == CylinderLiteEffectFlip || effect == CylinderLiteEffectPageSpin || effect == CylinderLiteEffectWheel) {
         [rows addObject:@{ @"kind": @"slider",
                            @"key": kSettingsCylinderLiteIntensityPct,
                            @"title": NSLocalizedString(@"Animation strength", nil),
@@ -9313,7 +9321,7 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
                            @"unit": @"%",
                            @"default": @90 }];
     }
-    if (settings_cylinderlite_effect_uses_opacity_controls(effect)) {
+    if (effect == CylinderLiteEffectSlide || settings_cylinderlite_effect_uses_scale_controls(effect)) {
         [rows addObject:@{ @"kind": @"slider",
                            @"key": kSettingsCylinderLiteOpacityPct,
                            @"title": NSLocalizedString(@"Minimum opacity", nil),
@@ -9323,14 +9331,6 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
                            @"unit": @"%",
                            @"default": @35 }];
     }
-    [rows addObject:@{ @"kind": @"slider",
-                       @"key": kSettingsCylinderLiteOneShotDurationMs,
-                       @"title": NSLocalizedString(@"Animation duration", nil),
-                       @"min": @250,
-                       @"max": @800,
-                       @"step": @50,
-                       @"unit": @"ms",
-                       @"default": @520 }];
     [rows addObject:@{ @"kind": @"info",
                        @"title": NSLocalizedString(@"Compatibility", nil),
                        @"subtitle": NSLocalizedString(@"Cylinder Lite, Watch Layout, Gravity Lite, SBCustomizer, and Home Layout Extras all affect Home Screen page/icon layout. Only one should be active at a time.", nil) }];
