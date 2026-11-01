@@ -54,7 +54,7 @@ static unsigned int s_cylinderlite_one_shot_cleanup_ticks = 0;
 // are applied; transformed frames must never be used to calculate swipe progress.
 typedef struct {
     uint64_t layer;
-    CATransform3D transform;
+    CATransform3D transform; // Saved sublayerTransform; never the page model transform.
     double opacity, width, height;
     float lastOpacity;
     bool modified;
@@ -64,9 +64,6 @@ static double s_last_offset = NAN;
 static double s_perspective_distance = 0;
 
 static void cl_restore_follow_pages(void);
-
-static RInvocation s_inv_transform;
-static RInvocation s_inv_opacity;
 
 static NSString * const kCylinderLiteAnimationKey = @"com.darksword.cylinderlite.page";
 
@@ -687,7 +684,7 @@ static CATransform3D cl_compensate_position(CATransform3D t, double offset)
 static bool cl_write_layer(CLPageVisual *page, CATransform3D transform, double opacity, double offset)
 {
     transform = cl_compensate_position(transform, offset);
-    r_msg2_main_raw(page->layer, "setTransform:", &transform, sizeof(transform),
+    r_msg2_main_raw(page->layer, "setSublayerTransform:", &transform, sizeof(transform),
                     NULL, 0, NULL, 0, NULL, 0);
     if (!remote_call_current_success()) return false;
     // CALayer.opacity is a float, unlike UIView.alpha (CGFloat).
@@ -726,7 +723,7 @@ static bool cl_capture_page(int index)
     float opacity = 1;
     if (!r_is_objc_ptr(layer) || !cl_get_rect(layer, "bounds", &bounds) ||
         bounds.width <= 1 || bounds.height <= 1 ||
-        !r_msg2_main_struct_ret(layer, "transform", &transform, sizeof(transform),
+        !r_msg2_main_struct_ret(layer, "sublayerTransform", &transform, sizeof(transform),
                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0) ||
         !r_msg2_main_struct_ret(layer, "opacity", &opacity, sizeof(opacity),
                                 NULL, 0, NULL, 0, NULL, 0, NULL, 0)) return false;
@@ -737,22 +734,6 @@ static bool cl_capture_page(int index)
     page->width = bounds.width;
     page->height = bounds.height;
     return r_is_objc_ptr(page->layer);
-}
-
-// Follow-path writer: enqueues transform+opacity with waitUntilDone:NO (via the
-// cached invocations) so both pages commit in one runloop turn after the barrier.
-// The synchronous cl_write_layer is kept for one-shot restoration paths.
-static bool cl_write_layer_fast(CLPageVisual *page, CATransform3D transform,
-                                double opacity, double offset)
-{
-    transform = cl_compensate_position(transform, offset);
-    if (!r_inv_invoke(&s_inv_transform, page->layer, &transform, false)) return false;
-    float alpha = (float)fmax(0.0, fmin(1.0, opacity));
-    if (alpha != page->lastOpacity) {
-        if (!r_inv_invoke(&s_inv_opacity, page->layer, &alpha, false)) return false;
-        page->lastOpacity = alpha;
-    }
-    return true;
 }
 
 // Page formulas adapted from Cylinder-Remade's CylinderAnimator.swift.
@@ -859,7 +840,7 @@ static bool cl_follow_effect(CLPageVisual *page, double offset)
     }
     // Mark before writing: a failed opacity call can follow a successful transform.
     page->modified = true;
-    return cl_write_layer_fast(page, CATransform3DConcat(t, page->transform), alpha * page->opacity, compensation);
+    return cl_write_layer(page, CATransform3DConcat(t, page->transform), alpha * page->opacity, compensation);
 }
 
 static bool cl_tick_follow(void)
@@ -883,10 +864,6 @@ static bool cl_tick_follow(void)
             page->modified = false;
         }
     }
-    // One synchronous main-thread hop flushes both enqueued writes in the same
-    // runloop turn (no inter-page tear) and bounds us to one sync per frame.
-    if (r_is_objc_ptr(s_cylinderlite_scroll))
-        r_perform_main(s_cylinderlite_scroll, r_sel("layoutIfNeeded"), 0, true);
     s_last_offset = offset.x;
     return true;
 }
@@ -1113,10 +1090,6 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     cl_clear_one_shot_cleanup(false);
     cl_clear_page_cache();
     bool cacheOK = cl_refresh_page_cache();
-    if (cacheOK) {
-        r_inv_build(&s_inv_transform, "setTransform:", sizeof(CATransform3D));
-        r_inv_build(&s_inv_opacity, "setOpacity:", sizeof(float));
-    }
     printf("[CYLINDERLITE] page cache result=%d; preparing templates next\n", cacheOK);
     cl_release_animation_templates();
     bool templatesOK = cacheOK && (followGesture || cl_prepare_animation_templates(effect));
@@ -1133,7 +1106,7 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
         s_cylinderlite_last_page = page;
         s_cylinderlite_last_list = list;
         printf("[CYLINDERLITE] armed %s monitor page=%d list=0x%llx pan=0x%llx effect=%d minScale=%d minOpacity=%d durationMs=%d templates=4\n",
-               s_cylinderlite_follow_gesture ? "v3-transform-only" : "one-shot",
+               s_cylinderlite_follow_gesture ? "v4-child-layers" : "one-shot",
                page,
                (unsigned long long)list,
                (unsigned long long)s_cylinderlite_pan,
@@ -1158,8 +1131,6 @@ bool cylinderlite_stop_in_session(void)
 {
     s_cylinderlite_active = false;
     cl_restore_follow_pages();
-    r_inv_free(&s_inv_transform);
-    r_inv_free(&s_inv_opacity);
     uint64_t listClass = r_class("SBIconListView");
     uint64_t key = r_nsstr_retained(kCylinderLiteAnimationKey.UTF8String);
     if (!r_is_objc_ptr(listClass) || !r_is_objc_ptr(key)) {
@@ -1199,8 +1170,6 @@ void cylinderlite_forget_remote_state(void)
 {
     // SpringBoard is gone: never release or message pointers from the old process.
     memset(s_page_visuals, 0, sizeof(s_page_visuals));
-    memset(&s_inv_transform, 0, sizeof(s_inv_transform));
-    memset(&s_inv_opacity, 0, sizeof(s_inv_opacity));
     s_last_offset = NAN;
     s_cylinderlite_active = false;
     s_cylinderlite_effect = CylinderLiteEffectZoomFadeOut;
