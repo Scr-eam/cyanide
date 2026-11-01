@@ -4770,14 +4770,17 @@ static void settings_start_cylinderlite_live_loop(void)
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSUInteger tick = 0;
         NSUInteger failures = 0;
-        // Remote calls add their own latency; this is a sleep budget, not an FPS guarantee.
-        useconds_t intervalUS = settings_live_interval(16000, 16000);
+        // 120 Hz = 8333 us/frame foreground; coarser when backgrounded. Deadline-paced
+        // below: we subtract the tick's own wall time (lock + remote IPC) from the
+        // frame budget instead of sleeping a fixed amount on top of it.
+        useconds_t frameBudgetUS = settings_live_interval(8333, 33333);
         @try {
-            printf("[SETTINGS] Cylinder Lite live loop started interval=%uus\n", intervalUS);
+            printf("[SETTINGS] Cylinder Lite live loop started frameBudget=%uus\n", frameBudgetUS);
             while ([d boolForKey:kSettingsCylinderLiteEnabled] &&
                    settings_tweak_is_applied(kSettingsCylinderLiteEnabled) &&
                    !settings_cleanup_in_progress() &&
                    !g_cylinderlite_live_stop_requested) {
+                uint64_t frameStartUS = settings_now_us();
                 bool ok = false;
                 @synchronized (settings_rc_lock()) {
                     if (settings_cleanup_in_progress() ||
@@ -4790,8 +4793,11 @@ static void settings_start_cylinderlite_live_loop(void)
                 failures = ok ? 0 : failures + 1;
                 if (!ok && failures >= settings_live_failure_limit(5)) break;
                 tick++;
-                settings_live_loop_sleep_interruptible(0,
-                                                       intervalUS,
+                // Re-read in case the app backgrounded mid-swipe.
+                frameBudgetUS = settings_live_interval(8333, 33333);
+                uint64_t deadlineUS = (frameStartUS != 0) ? frameStartUS + frameBudgetUS : 0;
+                settings_live_loop_sleep_interruptible(deadlineUS,
+                                                       frameBudgetUS,
                                                        &g_cylinderlite_live_stop_requested);
             }
         } @finally {
