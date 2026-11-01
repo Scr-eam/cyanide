@@ -742,3 +742,54 @@ uint64_t r_session_ivar_value(RemoteCallSession *session, uint64_t obj, const ch
 #undef R_SESSION_VOID
 #undef R_SESSION_RETURN
 #endif
+
+bool r_inv_build(RInvocation *ri, const char *selName, size_t argSize)
+{
+    memset(ri, 0, sizeof(*ri));
+    if (!selName || argSize == 0) return false;
+    ri->selName = selName;
+    ri->argSize = argSize;
+    ri->argBuf  = r_call_stable(R_TIMEOUT, "malloc", argSize, 0, 0, 0, 0, 0, 0, 0);
+    ri->valid   = (ri->argBuf != 0);
+    return ri->valid;
+}
+
+bool r_inv_invoke(RInvocation *ri, uint64_t target, const void *bytes, bool wait)
+{
+    if (!ri || !ri->valid || !r_is_objc_ptr(target) || !bytes) return false;
+
+    if (!ri->inv) {
+        uint64_t sel = r_sel(ri->selName);
+        if (!sel) return false;
+        uint64_t sig = r_method_signature(target, sel);
+        if (!r_is_objc_ptr(sig)) return false;
+        uint64_t NSInvocation = r_class("NSInvocation");
+        if (!r_is_objc_ptr(NSInvocation)) return false;
+        uint64_t inv = r_msg_retained_return(NSInvocation,
+                        r_sel("invocationWithMethodSignature:"), sig, 0, 0, 0);
+        if (!r_is_objc_ptr(inv)) return false;
+        r_msg2(inv, "setSelector:", sel, 0, 0, 0);
+        ri->inv = inv;
+        ri->target = 0;
+    }
+
+    if (!r_write_remote_arg(ri->argBuf, bytes, ri->argSize, ri->argSize)) return false;
+    r_msg2(ri->inv, "setArgument:atIndex:", ri->argBuf, 2, 0, 0);
+    if (target != ri->target) {
+        r_msg2(ri->inv, "setTarget:", target, 0, 0, 0);
+        ri->target = target;
+    }
+    uint64_t performSel = r_sel("performSelectorOnMainThread:withObject:waitUntilDone:");
+    uint64_t invokeSel  = r_sel("invoke");
+    if (!performSel || !invokeSel) return false;
+    r_msg(ri->inv, performSel, invokeSel, 0, wait ? 1 : 0, 0);
+    return true;
+}
+
+void r_inv_free(RInvocation *ri)
+{
+    if (!ri) return;
+    if (ri->inv)    r_msg2(ri->inv, "release", 0, 0, 0, 0);
+    if (ri->argBuf) r_free(ri->argBuf);
+    memset(ri, 0, sizeof(*ri));
+}

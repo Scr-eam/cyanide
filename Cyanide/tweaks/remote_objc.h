@@ -62,6 +62,24 @@ uint64_t r_dlsym_call(int timeout, const char *fnName,
 // byte was copied.
 bool     r_read_nsstring(uint64_t str, char *out, size_t outLen);
 
+// --- Reusable main-thread invocation for a single by-value struct arg. ---
+// Build once; each frame rewrites the arg bytes and re-invokes, instead of
+// rebuilding an NSInvocation per call. invoke with wait=false to enqueue
+// (coalesce), then issue one wait=true barrier message per tick.
+typedef struct {
+    const char *selName;
+    uint64_t    inv;
+    uint64_t    argBuf;
+    size_t      argSize;
+    uint64_t    target;
+    bool        valid;
+} RInvocation;
+
+bool r_inv_build(RInvocation *ri, const char *selName, size_t argSize);
+bool r_inv_invoke(RInvocation *ri, uint64_t target, const void *bytes, bool wait);
+void r_inv_free(RInvocation *ri);
+
+
 #ifdef __OBJC__
 uint64_t r_session_alloc_str(RemoteCallSession *session, const char *s);
 void     r_session_free(RemoteCallSession *session, uint64_t ptr);
