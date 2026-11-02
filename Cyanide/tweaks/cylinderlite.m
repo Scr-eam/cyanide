@@ -54,7 +54,7 @@ static unsigned int s_cylinderlite_one_shot_cleanup_ticks = 0;
 // are applied; transformed frames must never be used to calculate swipe progress.
 typedef struct {
     uint64_t layer;
-    CATransform3D transform; // Saved sublayerTransform; never the page model transform.
+    CATransform3D transform;
     double opacity, width, height;
     float lastOpacity;
     bool modified;
@@ -63,7 +63,21 @@ static CLPageVisual s_page_visuals[16];
 static double s_last_offset = NAN;
 static double s_perspective_distance = 0;
 
-static void cl_restore_follow_pages(void);
+enum { CL_ICON_CAP = 128 };
+typedef struct {
+    uint64_t view, parent, index;
+    CLRect frame, movedFrame;
+    bool moved;
+} CLIconHome;
+typedef struct {
+    uint64_t overlay;
+    int count;
+    bool prepared;
+    CLIconHome icons[CL_ICON_CAP];
+} CLIconPage;
+static CLIconPage s_icon_pages[16];
+static bool cl_restore_follow_pages(void);
+static bool cl_capture_page(int index);
 
 static NSString * const kCylinderLiteAnimationKey = @"com.darksword.cylinderlite.page";
 
@@ -533,7 +547,7 @@ static void cl_clear_page_cache(void)
 
 static bool cl_refresh_page_cache(void)
 {
-    cl_restore_follow_pages();
+    if (!cl_restore_follow_pages()) return false;
     cl_clear_page_cache();
 
     uint64_t scrollClass = r_class("SBIconScrollView");
@@ -614,7 +628,13 @@ static bool cl_refresh_page_cache(void)
            (unsigned long long)s_cylinderlite_pan,
            s_cylinderlite_list_count,
            s_cylinderlite_page_width);
-    return r_is_objc_ptr(s_cylinderlite_pan);
+    if (!r_is_objc_ptr(s_cylinderlite_pan)) return false;
+    if (s_cylinderlite_follow_gesture) {
+        for (int i = 0; i < s_cylinderlite_list_count; i++) {
+            if (!cl_capture_page(i)) { cl_restore_follow_pages(); return false; }
+        }
+    }
+    return true;
 }
 
 static uint64_t cl_list_for_page(int page)
@@ -684,7 +704,7 @@ static CATransform3D cl_compensate_position(CATransform3D t, double offset)
 static bool cl_write_layer(CLPageVisual *page, CATransform3D transform, double opacity, double offset)
 {
     transform = cl_compensate_position(transform, offset);
-    r_msg2_main_raw(page->layer, "setSublayerTransform:", &transform, sizeof(transform),
+    r_msg2_main_raw(page->layer, "setTransform:", &transform, sizeof(transform),
                     NULL, 0, NULL, 0, NULL, 0);
     if (!remote_call_current_success()) return false;
     // CALayer.opacity is a float, unlike UIView.alpha (CGFloat).
@@ -700,40 +720,160 @@ static bool cl_write_layer(CLPageVisual *page, CATransform3D transform, double o
     return true;
 }
 
-static void cl_restore_follow_pages(void)
+// Live icon ownership follows Gravity's iOS 26 path. The overlay is inside
+// the scrolling list so native paging still supplies translation and gestures.
+// Only this dedicated view is transformed; icon image/label subtrees stay intact.
+static bool cl_set_rect_checked(uint64_t view, const char *selector, CLRect rect)
 {
-    for (int i = 0; i < 16; i++) {
-        CLPageVisual *page = &s_page_visuals[i];
-        if (!page->layer) continue;
-        if (page->modified && !cl_write_layer(page, page->transform, page->opacity, 0))
-            log_user("[CYLINDERLITE] Page restoration call failed.\n");
-        r_msg2_main(page->layer, "release", 0, 0, 0, 0);
+    r_msg2_main_raw(view, selector, &rect, sizeof(rect), NULL, 0, NULL, 0, NULL, 0);
+    return remote_call_current_success();
+}
+
+static bool cl_restore_icon_page(int index)
+{
+    CLIconPage *group = &s_icon_pages[index];
+    CLPageVisual *page = &s_page_visuals[index];
+    if (page->modified) {
+        if (!cl_write_layer(page, page->transform, page->opacity, 0)) return false;
+        page->modified = false;
     }
-    memset(s_page_visuals, 0, sizeof(s_page_visuals));
+    // Records were sorted by original sibling index before moving anything.
+    for (int i = 0; i < group->count; i++) {
+        CLIconHome *item = &group->icons[i];
+        if (!item->moved) continue;
+        uint64_t parent = r_msg2_main(item->view, "superview", 0, 0, 0, 0);
+        if (!remote_call_current_success()) return false;
+        if (parent == group->overlay) {
+            uint64_t children = r_msg2_main(item->parent, "subviews", 0, 0, 0, 0);
+            if (!remote_call_current_success() || !r_is_objc_ptr(children)) return false;
+            uint64_t count = r_msg2_main(children, "count", 0, 0, 0, 0);
+            if (!remote_call_current_success()) return false;
+            uint64_t at = item->index < count ? item->index : count;
+            r_msg2_main(item->parent, "insertSubview:atIndex:", item->view, at, 0, 0);
+            if (!remote_call_current_success()) return false;
+            // Keep moved=true until geometry is restored, allowing a retry.
+            if (!cl_set_rect_checked(item->view, "setFrame:", item->frame)) return false;
+        } else if (parent == item->parent) {
+            if (!cl_set_rect_checked(item->view, "setFrame:", item->frame)) return false;
+        }
+        // If SpringBoard moved an icon elsewhere, respect its new ownership.
+        item->moved = false;
+    }
+    if (group->overlay) {
+        r_msg2_main(group->overlay, "removeFromSuperview", 0, 0, 0, 0);
+        if (!remote_call_current_success()) return false;
+    }
+    for (int i = 0; i < group->count; i++) {
+        if (group->icons[i].view) r_msg2_main(group->icons[i].view, "release", 0, 0, 0, 0);
+        if (group->icons[i].parent) r_msg2_main(group->icons[i].parent, "release", 0, 0, 0, 0);
+    }
+    if (page->layer) r_msg2_main(page->layer, "release", 0, 0, 0, 0);
+    if (group->overlay) r_msg2_main(group->overlay, "release", 0, 0, 0, 0);
+    memset(group, 0, sizeof(*group));
+    memset(page, 0, sizeof(*page));
+    return true;
+}
+
+static bool cl_restore_follow_pages(void)
+{
+    bool ok = true;
+    for (int i = 0; i < 16; i++) {
+        if (!cl_restore_icon_page(i)) ok = false;
+    }
     s_last_offset = NAN;
+    if (!ok) log_user("[CYLINDERLITE] Icon restore interrupted; deactivate again before applying another effect.\n");
+    return ok;
 }
 
 static bool cl_capture_page(int index)
 {
+    CLIconPage *group = &s_icon_pages[index];
     CLPageVisual *page = &s_page_visuals[index];
-    if (page->layer) return true;
-    uint64_t layer = cl_safe_msg(s_cylinderlite_lists[index], "layer", 0, 0, 0, 0);
+    if (group->prepared) return true;
+    if (group->overlay || group->count) return false;
+    uint64_t list = s_cylinderlite_lists[index];
     CLRect bounds = {0};
-    CATransform3D transform;
-    float opacity = 1;
-    if (!r_is_objc_ptr(layer) || !cl_get_rect(layer, "bounds", &bounds) ||
-        bounds.width <= 1 || bounds.height <= 1 ||
-        !r_msg2_main_struct_ret(layer, "sublayerTransform", &transform, sizeof(transform),
-                                NULL, 0, NULL, 0, NULL, 0, NULL, 0) ||
-        !r_msg2_main_struct_ret(layer, "opacity", &opacity, sizeof(opacity),
-                                NULL, 0, NULL, 0, NULL, 0, NULL, 0)) return false;
+    if (!cl_get_rect(list, "bounds", &bounds) || bounds.width <= 1 || bounds.height <= 1) return false;
+    uint64_t iconClass = r_class("SBIconView");
+    if (!r_is_objc_ptr(iconClass)) return false;
+    uint64_t icons[CL_ICON_CAP + 1] = {0};
+    int count = sb_collect_views(list, iconClass, icons, CL_ICON_CAP + 1);
+    if (count > CL_ICON_CAP) return false;
+    // Empty/widget-only lists are deliberately left alone; never fall back to
+    // mutating the real page layer in this experiment.
+    if (!count) { group->prepared = true; return true; }
+    for (int i = 0; i < count; i++) {
+        uint64_t icon = icons[i];
+        CLIconHome item = {0};
+        CLTransform transform = {0};
+        uint64_t parent = cl_safe_msg(icon, "superview", 0, 0, 0, 0);
+        if (!r_is_objc_ptr(parent) || !cl_get_rect(icon, "frame", &item.frame) ||
+            !r_msg2_main_struct_ret(icon, "transform", &transform, sizeof(transform),
+                NULL, 0, NULL, 0, NULL, 0, NULL, 0)) goto fail;
+        // setFrame is undefined with a nonidentity UIView transform. Do not
+        // take ownership of icons another tweak is already transforming.
+        if (transform.a != 1 || transform.d != 1 || transform.b != 0 ||
+            transform.c != 0 || transform.tx != 0 || transform.ty != 0) goto fail;
+        if (!r_msg2_main_struct_ret(parent, "convertRect:toView:",
+                &item.movedFrame, sizeof(item.movedFrame), &item.frame, sizeof(item.frame),
+                &list, sizeof(list), NULL, 0, NULL, 0)) goto fail;
+        uint64_t siblings = cl_safe_msg(parent, "subviews", 0, 0, 0, 0);
+        if (!r_is_objc_ptr(siblings)) goto fail;
+        item.index = r_msg2_main(siblings, "indexOfObjectIdenticalTo:", icon, 0, 0, 0);
+        if (!remote_call_current_success() || item.index > 100000) goto fail;
+        // Own each reference before any hierarchy mutation, including failures.
+        CLIconHome *saved = &group->icons[group->count++];
+        *saved = item;
+        saved->view = r_msg2_main(icon, "retain", 0, 0, 0, 0);
+        if (!r_is_objc_ptr(saved->view)) { saved->view = 0; goto fail; }
+        if (!remote_call_current_success()) goto fail;
+        saved->parent = r_msg2_main(parent, "retain", 0, 0, 0, 0);
+        if (!r_is_objc_ptr(saved->parent)) { saved->parent = 0; goto fail; }
+        if (!remote_call_current_success()) goto fail;
+    }
+    for (int i = 1; i < group->count; i++) {
+        CLIconHome item = group->icons[i];
+        int j = i;
+        while (j > 0 && (group->icons[j-1].parent > item.parent ||
+               (group->icons[j-1].parent == item.parent && group->icons[j-1].index > item.index))) {
+            group->icons[j] = group->icons[j-1]; j--;
+        }
+        group->icons[j] = item;
+    }
+    uint64_t viewClass = r_class("UIView");
+    if (!r_is_objc_ptr(viewClass)) goto fail;
+    uint64_t allocated = r_msg2_main(viewClass, "alloc", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(allocated)) goto fail;
+    group->overlay = r_msg2_main_raw(allocated, "initWithFrame:", &bounds, sizeof(bounds),
+        NULL, 0, NULL, 0, NULL, 0);
+    if (!r_is_objc_ptr(group->overlay)) { group->overlay = 0; goto fail; }
+    if (!cl_set_rect_checked(group->overlay, "setBounds:", bounds)) goto fail;
+    // Interactive container preserves icon taps and lets gestures bubble to the
+    // original scrolling list. No window-wide overlay intercepts paging.
+    r_msg2_main(list, "addSubview:", group->overlay, 0, 0, 0);
+    if (!remote_call_current_success()) goto fail;
+    uint64_t layer = cl_safe_msg(group->overlay, "layer", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(layer)) goto fail;
     page->layer = r_msg2_main(layer, "retain", 0, 0, 0, 0);
-    page->transform = transform;
-    page->opacity = opacity;
-    page->lastOpacity = opacity;
+    if (!r_is_objc_ptr(page->layer)) { page->layer = 0; goto fail; }
+    if (!remote_call_current_success()) goto fail;
+    page->transform = CATransform3DIdentity;
+    page->opacity = page->lastOpacity = 1;
     page->width = bounds.width;
     page->height = bounds.height;
-    return r_is_objc_ptr(page->layer);
+    for (int i = 0; i < group->count; i++) {
+        CLIconHome *item = &group->icons[i];
+        item->moved = true;
+        r_msg2_main(group->overlay, "addSubview:", item->view, 0, 0, 0);
+        if (!remote_call_current_success() ||
+            !cl_set_rect_checked(item->view, "setFrame:", item->movedFrame)) goto fail;
+    }
+    group->prepared = true;
+    printf("[CYLINDERLITE] live icon container page=%d icons=%d\n", index, group->count);
+    return true;
+fail:
+    cl_restore_icon_page(index);
+    return false;
 }
 
 // Page formulas adapted from Cylinder-Remade's CylinderAnimator.swift.
@@ -858,6 +998,7 @@ static bool cl_tick_follow(void)
                        s_cylinderlite_list_x[i] + s_cylinderlite_page_width > offset.x;
         if (visible && fabs(delta) > 0.5) {
             if (!cl_capture_page(i)) return false;
+            if (!page->layer) continue;
             if (!cl_follow_effect(page, delta)) return false;
         } else if (page->modified) {
             if (!cl_write_layer(page, page->transform, page->opacity, 0)) return false;
@@ -1077,8 +1218,9 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     if (effect < CylinderLiteEffectSlide || effect > CylinderLiteEffectLast) {
         effect = CylinderLiteEffectZoomFadeOut;
     }
+    s_cylinderlite_active = false;
+    if (!cl_restore_follow_pages()) return false;
     cl_remove_cached_page_animations();
-    cl_restore_follow_pages();
     s_cylinderlite_effect = effect;
     s_cylinderlite_intensity_pct = cl_clamp_int(intensityPct, 70, 100);
     s_cylinderlite_opacity_pct = cl_clamp_int(opacityPct, 10, 100);
@@ -1106,7 +1248,7 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
         s_cylinderlite_last_page = page;
         s_cylinderlite_last_list = list;
         printf("[CYLINDERLITE] armed %s monitor page=%d list=0x%llx pan=0x%llx effect=%d minScale=%d minOpacity=%d durationMs=%d templates=4\n",
-               s_cylinderlite_follow_gesture ? "v4-child-layers" : "one-shot",
+               s_cylinderlite_follow_gesture ? "v5-live-icons" : "one-shot",
                page,
                (unsigned long long)list,
                (unsigned long long)s_cylinderlite_pan,
@@ -1118,6 +1260,7 @@ bool cylinderlite_apply_in_session_with_options(CylinderLiteEffect effect,
     log_user(ok
         ? "[CYLINDERLITE] Page animation monitor armed. Swipe between Home Screen pages to test it.\n"
         : "[CYLINDERLITE] Could not locate the current Home Screen page.\n");
+    if (!ok) cl_restore_follow_pages();
     s_cylinderlite_active = ok;
     return ok;
 }
@@ -1130,7 +1273,7 @@ bool cylinderlite_apply_in_session(CylinderLiteEffect effect)
 bool cylinderlite_stop_in_session(void)
 {
     s_cylinderlite_active = false;
-    cl_restore_follow_pages();
+    if (!cl_restore_follow_pages()) return false;
     uint64_t listClass = r_class("SBIconListView");
     uint64_t key = r_nsstr_retained(kCylinderLiteAnimationKey.UTF8String);
     if (!r_is_objc_ptr(listClass) || !r_is_objc_ptr(key)) {
@@ -1170,6 +1313,7 @@ void cylinderlite_forget_remote_state(void)
 {
     // SpringBoard is gone: never release or message pointers from the old process.
     memset(s_page_visuals, 0, sizeof(s_page_visuals));
+    memset(s_icon_pages, 0, sizeof(s_icon_pages));
     s_last_offset = NAN;
     s_cylinderlite_active = false;
     s_cylinderlite_effect = CylinderLiteEffectZoomFadeOut;
